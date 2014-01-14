@@ -1,0 +1,537 @@
+#!/usr/bin/perl
+
+# Author: Tregaron Bayly <tbayly@bluehost.com>
+
+use warnings;
+use strict;
+use File::Slurp;
+use Term::Cap;
+use Term::ReadKey;
+use Term::ANSIColor qw(:constants);
+
+ReadMode 4;
+END { ReadMode 0 }
+
+my $stats = {};
+my $interval = 2;
+my $sort_column = "write_mbytes";
+my $all = 0;
+my $filter = "all pvs";
+my $report = 0;
+my $hchar = 0;
+my $wchar = 0;
+my @reports = qw( disk initiator );
+my $last = time();
+my $original = 0;
+my $time = "old";
+my $elapsed = 0;
+
+my $run = {
+    'esc'  =>   \&escape_key,
+    'q'    =>   \&quit_me,
+    'h'    =>   \&help,
+    'H'    =>   \&help,
+    '?'    =>   \&help,
+    'r'    =>   sub { $sort_column = "read_mbytes"; },
+    'w'    =>   sub { $sort_column = "write_mbytes"; },
+    'c'    =>   sub { $sort_column = "num_cmds"; },
+    'a'    =>   sub { if ($all) { $all = 0; } else { $all = 1; } },
+    'd'    =>   sub { disk_filter($stats) },
+    'm'    =>   \&group,
+    'p'    =>   sub { pause($stats) },
+    't'    =>   \&time_change,
+};
+
+binmode(\*STDOUT, ":utf8");
+
+my $ospeed = eval {
+    require POSIX;
+    my $termios = POSIX::Termios->new();
+    $termios->getattr;
+    $termios->getospeed;
+} || 9600;
+
+my $control = "d";
+my $i       = 0;
+
+my $terminal = Term::Cap->Tgetent({ TERM => undef, OSPEED => $ospeed });
+#$terminal->Tputs('cl', 1, STDOUT);          # Clear screen.
+
+sub draw {
+    my $hash = shift;
+
+    $terminal->Tgoto('cm', 0, 2, \*STDOUT );    
+    current_to_old($stats);
+    get_stats($stats);
+    find_devils($stats);
+}
+
+get_stats($stats);
+lv_map($stats);
+print "Waiting for first collection interval...\n";
+select(undef,undef,undef, $interval);
+
+#############
+# MAIN LOOP #
+#############
+
+while (1) {
+    ($wchar, $hchar) = GetTerminalSize();
+
+    while (defined (my $key = ReadKey(-1))) {
+        if ($key =~ /^[qrwchHadmpt?]$/) {
+            &{$run->{$key}};
+        }
+    }
+    clear_terminal();
+    top_bar($hchar, $wchar);
+    bottom_bar($hchar, $wchar);
+    draw($stats);
+    select (undef, undef, undef, $interval);
+}
+
+###############
+# SUBROUTINES #
+###############
+
+sub find_devils {
+    my $hash = shift;
+
+    my $sorted = {};
+    my $tally = {};
+    my $namelength = 0;
+
+    foreach my $dev (keys %{$hash->{devs}}) {
+        my $value = ($hash->{devs}->{$dev}->{$sort_column} - $hash->{devs}->{$dev}->{$time}->{$sort_column});
+        if (($value || $all) && 
+            ($filter eq "all pvs" || defined($hash->{pvs}->{$filter}->{$dev}))) {
+            if ($reports[$report] eq "initiator" && defined($hash->{backstores}->{$hash->{devs}->{$dev}->{backstore}}->{iqn})) {
+                my $iqn = $hash->{backstores}->{$hash->{devs}->{$dev}->{backstore}}->{iqn};
+                if (length($iqn) > $namelength) { $namelength = length($iqn); }
+                $sorted->{$iqn}->{read_mbytes} += ($hash->{devs}->{$dev}->{read_mbytes} - $hash->{devs}->{$dev}->{$time}->{read_mbytes});
+                $sorted->{$iqn}->{write_mbytes} += ($hash->{devs}->{$dev}->{write_mbytes} - $hash->{devs}->{$dev}->{$time}->{write_mbytes});
+                $sorted->{$iqn}->{num_cmds} += ($hash->{devs}->{$dev}->{num_cmds} - $hash->{devs}->{$dev}->{$time}->{num_cmds});
+            }
+            elsif ($reports[$report] eq "disk") {
+                if (length($dev) > $namelength) { $namelength = length($dev); }
+                $sorted->{$dev}->{read_mbytes} = ($hash->{devs}->{$dev}->{read_mbytes} - $hash->{devs}->{$dev}->{$time}->{read_mbytes});
+                $sorted->{$dev}->{write_mbytes} = ($hash->{devs}->{$dev}->{write_mbytes} - $hash->{devs}->{$dev}->{$time}->{write_mbytes});
+                $sorted->{$dev}->{num_cmds} = ($hash->{devs}->{$dev}->{num_cmds} - $hash->{devs}->{$dev}->{$time}->{num_cmds});
+            }
+        }
+    }
+
+    my $count = 0;
+    my $max = $hchar - 6; 
+    my $label = "";
+    
+
+    if ($reports[$report] eq "initiator") {
+        $label = "Initiator Name";
+    }
+    elsif ($reports[$report] eq "disk") {
+        $label = "Disk Name";
+    }
+    print BOLD WHITE $label;
+    $namelength ||= length($label);
+
+    for (my $i = 1; $i <= ($namelength - length($label) + 3); $i++) {
+        print " ";
+    }
+    print RESET;
+    $sort_column eq "read_mbytes" ? print BOLD WHITE UNDERLINE : print BOLD WHITE;
+    print "Read MB/s", RESET;
+    print "  ";
+    $sort_column eq "write_mbytes" ? print BOLD WHITE UNDERLINE : print BOLD WHITE;
+    print "Write MB/s", RESET;
+    print "  ";
+    $sort_column eq "num_cmds" ? print BOLD WHITE UNDERLINE : print BOLD WHITE;
+    print "Num Cmds/s", RESET;
+    print "  ";
+    print BOLD WHITE "Backstore Name  ", RESET;
+    print "\n";
+    foreach my $key ( map { $_->[0] } sort { $b->[1] <=> $a->[1] } map { [ $_, $sorted->{$_}->{$sort_column} ] } keys %{$sorted}) {
+        if ($sorted->{$key}->{$sort_column} > 0) {
+            print YELLOW;
+        }
+        my $iqn = "";
+        my $pv = "";
+#        if (defined($hash->{backstores}->{$hash->{devs}->{$key}->{backstore}}->{iqn})) { $iqn = $hash->{backstores}->{$hash->{devs}->{$key}->{backstore}}->{iqn}; }
+#            printf("%-40s  %10.1f  %10.1f  %10.1f  %16s %20s\n", 
+            printf("%-${namelength}s  %10.1f  %10.1f  %10.1f\n",
+                           $key, 
+                           $sorted->{$key}->{read_mbytes} / $elapsed,
+                           $sorted->{$key}->{write_mbytes} / $elapsed,
+                           $sorted->{$key}->{num_cmds} / $elapsed,
+                          );
+            print RESET;
+        $count++;
+        last if $count >= $max;
+    }
+
+}
+
+sub current_to_old {
+    my $hash = shift;
+    
+    foreach my $dev (keys %{$hash->{devs}}) {
+        if (defined($hash->{devs}->{$dev}->{num_cmds})) {
+            $hash->{devs}->{$dev}->{old}->{num_cmds}     = $hash->{devs}->{$dev}->{num_cmds};
+            unless ($original) { $hash->{devs}->{$dev}->{original}->{num_cmds} = $hash->{devs}->{$dev}->{num_cmds}; }
+        }
+        if (defined($hash->{devs}->{$dev}->{read_mbytes})) {
+            $hash->{devs}->{$dev}->{old}->{read_mbytes}  = $hash->{devs}->{$dev}->{read_mbytes};
+            unless ($original) { $hash->{devs}->{$dev}->{original}->{read_mbytes} = $hash->{devs}->{$dev}->{read_mbytes}; }
+        }
+        if (defined($hash->{devs}->{$dev}->{write_mbytes})) {
+            $hash->{devs}->{$dev}->{old}->{write_mbytes} = $hash->{devs}->{$dev}->{write_mbytes};
+            unless ($original) { $hash->{devs}->{$dev}->{original}->{write_mbytes} = $hash->{devs}->{$dev}->{write_mbytes}; }
+        }
+    }
+    $original ||= $last;
+}
+
+sub get_stats {
+    my $hash = shift;
+
+    my $current = time();
+    if ($time eq "original" && $original) { $elapsed = $current - $original; }
+    else { $elapsed = $current - $last; }     
+    $elapsed ||= 1;
+    my $base = "/sys/kernel/config/target/core";
+
+    opendir my $baseh, $base || die "Error opening $base: $!\n";
+    while (my $iblock = readdir $baseh) {
+        next if $iblock !~ /iblock_/;
+        
+        if (opendir my $iblockh, "$base/$iblock") {
+           while (my $backstore = readdir $iblockh) {
+                next if $backstore =~ /^(hba|\.)/;
+                my $dev = read_file("$base/$iblock/$backstore/udev_path");
+                chomp($dev);
+                $dev =~ /\/dev\/.*\/(.*)$/;
+                $dev = $1;
+                $hash->{devs}->{$dev}->{backstore} = $backstore;
+                if ( -e "$base/$iblock/$backstore/statistics/scsi_lu/num_cmds") {
+                    my $num_cmds = read_file("$base/$iblock/$backstore/statistics/scsi_lu/num_cmds");
+                    chomp($num_cmds);
+                    $hash->{devs}->{$dev}->{num_cmds} = $num_cmds;
+                }
+                if ( -e "$base/$iblock/$backstore/statistics/scsi_lu/read_mbytes") {
+                    my $read_mbytes = read_file("$base/$iblock/$backstore/statistics/scsi_lu/read_mbytes");
+                    chomp($read_mbytes);
+                    $hash->{devs}->{$dev}->{read_mbytes} = $read_mbytes;
+                }
+                if ( -e "$base/$iblock/$backstore/statistics/scsi_lu/write_mbytes") {
+                    my $write_mbytes = read_file("$base/$iblock/$backstore/statistics/scsi_lu/write_mbytes");
+                    chomp($write_mbytes);
+                    $hash->{devs}->{$dev}->{write_mbytes} = $write_mbytes;
+                }
+            }            
+
+            closedir $iblockh;
+        }
+        else {
+            warn "Error opening $base/$iblock: $!\n";
+        }
+    }
+    closedir $baseh;
+
+    $base = "/sys/kernel/config/target/iscsi";
+    opendir $baseh, $base || die "Error opening $base: $!\n";
+    while (my $iqn = readdir $baseh) {
+        next unless $iqn =~ /^iqn/;
+        if (opendir my $iqnh, "$base/$iqn") {
+            while (my $tpg = readdir $iqnh) {
+                next unless $tpg =~ /^tpg/;
+                if( opendir my $lunh, "$base/$iqn/$tpg/lun/") {
+                    while (my $lun = readdir $lunh) {
+                        next unless $lun =~ /^lun_/;
+                        if (opendir my $detailh, "$base/$iqn/$tpg/lun/$lun/") {
+                            while (my $file = readdir $detailh) {
+                                next unless $file =~ /^(?!(\.)|(statistics)|(alua))/;
+                               my $path = readlink("$base/$iqn/$tpg/lun/$lun/$file");
+                               $path =~ s/.*\///g; # Greedy match - get the bit after the final '/'
+            
+                                $stats->{backstores}->{$path}->{iqn} = $iqn;
+                            }
+                            closedir $detailh
+                        }
+                        else {
+                            warn "Error opening $base/$iqn/$tpg/lun/$lun: $!\n";
+                        }
+                    }
+                    closedir $lunh;
+                }
+                else {
+                    warn "Error opening $base/$iqn/$tpg/lun: $!\n";
+                }
+            }
+            closedir $iqnh;
+        }
+        else {
+            warn "Error opening $base/$iqn: $!\n";
+        }
+    }
+    closedir $baseh;
+
+    $last = $current;
+}
+
+sub bottom_bar {
+    $terminal->Tgoto('cm', 0, $hchar, \*STDOUT );
+     
+    print BOLD BLUE ON_WHITE " ";
+    print BOLD BLUE ON_WHITE UNDERLINE "H", RESET;
+    print BOLD BLUE ON_WHITE "elp";
+    for (my $i = 1; $i <= ($wchar - length(" Help") - length("Quit")); $i++) {
+        print " ";
+    }
+    print RESET;
+    print BOLD BLUE ON_WHITE UNDERLINE "Q", RESET;
+    print BOLD BLUE ON_WHITE, "uit", RESET;
+}
+
+sub top_bar {
+    my $top_left = "SAN top:  $filter, grouped by $reports[$report], activity over the last $elapsed seconds";
+    my $top_right = "";   
+ 
+    $terminal->Tgoto('cm', 0, 0, \*STDOUT );
+    
+    print BOLD BLUE ON_WHITE, "$top_left";
+    for (my $i = 1; $i <= ($wchar -length($top_left) - length($top_right)); $i++) {
+        print " ";
+    }
+    print "$top_right";
+    print RESET;
+
+}
+
+sub ask {
+    ReadMode 0;
+    print "What shall we do now?:";
+    my $answer = <>;
+    chomp $answer;
+    print "\nYou told me to $answer\n";
+    ReadMode 4;
+}
+
+sub escape_key {
+  print "I just caught the escape key!\n";
+}
+
+sub quit_me {
+    clear_terminal();
+    print "Goodbye!\n";
+    exit(0);
+}
+
+sub control {
+  my $format = shift;
+
+  print "Switching to $format\n";
+  $control = $format;
+}
+
+sub help {
+    clear_terminal();
+    top_bar();
+    bottom_bar();
+#    $terminal->Tgoto('cm', 0, $hchar / 2, \*STDOUT);
+
+    $terminal->Tgoto('cm', 0, 3, \*STDOUT );
+    my $box_width = 49;
+
+    line("\N{U+2554}","\N{U+2550}","\N{U+2557}", $box_width);
+    linestart(); 
+        print BOLD WHITE "         Help for Interactive Commands         ", RESET; 
+    lineend();
+    line("\N{U+255F}","\N{U+2500}","\N{U+2562}", $box_width);
+    line("\N{U+2551}"," ","\N{U+2551}", $box_width);
+    linestart(); 
+        print BOLD WHITE " Sorting                                       ", RESET; 
+    lineend();
+    linestart(); 
+        print YELLOW " r", RESET;
+        print "      sort by Read MB                        ";
+    lineend();
+    linestart();
+        print YELLOW " w", RESET;
+        print "      sort by Write MB                       ";
+    lineend();
+    linestart();
+        print YELLOW " c", RESET;
+        print "      sort by Number of commands             ";
+    lineend();
+    line("\N{U+2551}"," ","\N{U+2551}", $box_width);
+    linestart();
+        print BOLD WHITE " Filtering                                     ", RESET;
+    lineend();
+    linestart();
+        print YELLOW " a", RESET;
+        print "      Toggle zero-count items on/off         ";
+    lineend();
+    linestart();
+        print YELLOW " d", RESET;
+        print "      show only a specified physical disk    ";
+    lineend();
+    line("\N{U+2551}"," ","\N{U+2551}", $box_width);
+    linestart(); 
+        print BOLD WHITE " Changing views                                ", RESET;
+    lineend();
+    linestart();
+        print YELLOW " t", RESET;
+        print "      Toggle show data for all|last interval ";
+    lineend();
+    linestart();
+        print YELLOW " m", RESET;
+        print "      Cycle through different grouping modes ";
+    lineend();
+    line("\N{U+2551}"," ","\N{U+2551}", $box_width);
+    linestart();
+        print BOLD WHITE " Navigation                                    ", RESET;
+    lineend();
+    linestart();
+        print YELLOW " h,H,?", RESET;
+        print "  This help screen                       ";
+    lineend();
+    linestart();
+        print YELLOW " p", RESET;
+        print "      Pause the screen                       ";
+    lineend();
+    linestart();
+        print YELLOW " q", RESET;
+        print "      Quit                                   ";
+    lineend();
+    line("\N{U+255A}","\N{U+2550}","\N{U+255D}",$box_width);
+
+    print "              <ENTER> to continue              \n";
+    my $ignore = <>;
+    clear_terminal();
+    top_bar();
+    bottom_bar();
+}
+
+sub clear_terminal {
+    $terminal->Tgoto('cm', 0, 0, \*STDOUT );
+    for (my $i = 0; $i <= $hchar; $i++) {
+        $terminal->Tputs('dl', 1, \*STDOUT );
+    }
+}
+
+sub line {
+    my $left = shift;
+    my $fill = shift;
+    my $right = shift;
+    my $length = shift;
+
+    print $left;
+    for (my $i = 1; $i <= $length - 2; $i++) {
+        print $fill;
+    }
+    print "$right\n";
+}
+
+sub linestart {
+    print "\N{U+2551}";
+}
+
+sub lineend {
+    linestart();
+    print "\n";
+}
+
+sub lv_map {
+    my $hash = shift;
+
+    my $lv = "";
+    my $pv = "";
+
+    my @lvdisplay_output = `/sbin/lvdisplay --map`;
+    foreach my $line (@lvdisplay_output) {
+        if ($line =~ /LV Name\s+(.*)/) {
+            $lv = $1;
+            $lv =~ s/\///g; # Greedy match - get the bit after the final '/'
+            $pv = "";
+        }
+        elsif ($line =~ /Physical volume\s+(.*)/) {
+            $pv = $1;
+            $hash->{pvs}->{$pv}->{$lv} = 1;
+            if (defined($hash->{devs}->{$lv})) { $hash->{devs}->{$lv}->{pv} = $pv; }
+        }
+    }
+
+}
+
+sub disk_filter {
+    my $hash = shift;
+
+    clear_terminal();
+    top_bar();
+    bottom_bar();
+    $terminal->Tgoto('cm', 0, 3, \*STDOUT);
+
+    my $box_width = 49;
+    line("\N{U+2554}","\N{U+2550}","\N{U+2557}", $box_width);
+    linestart();
+        print BOLD WHITE "       Choose a filter and press <ENTER>       ", RESET;
+    lineend();
+    line("\N{U+255F}","\N{U+2500}","\N{U+2562}", $box_width);
+    line("\N{U+2551}"," ","\N{U+2551}", $box_width);
+    my @choices = (sort {$hash->{pvs}->{$a} <=> $hash->{pvs}->{$b} } keys %{$hash->{pvs}});
+    unshift(@choices, "all pvs");
+    for (my $j = 0; $j <= $#choices; $j++) {
+        my $text = " $j) $choices[$j]";
+        my $padding = ($box_width - length($text) - 2);
+        linestart();
+            if ($filter eq $choices[$j]) { 
+                print BOLD GREEN $text, RESET;
+            }
+            else { 
+                print DARK $text, RESET;
+            }
+            for (my $i = 1; $i <= $padding; $i++) {
+                print " ";
+            }
+        lineend();
+    }
+    line("\N{U+2551}"," ","\N{U+2551}", $box_width);
+    line("\N{U+255A}","\N{U+2550}","\N{U+255D}",$box_width);
+
+    my $disk = <>;    
+    chomp $disk;
+  
+    if ($disk =~ /\d+/ && defined($choices[$disk])) {
+        # Looks good.  Do some stuff
+        $filter = $choices[$disk];
+        clear_terminal();
+        top_bar();
+        bottom_bar();
+    }
+    else {
+        disk_filter($hash);
+    }
+}
+
+sub group {
+    
+    my $j = $report + 1;
+    if ($j > $#reports) { $report = 0; }
+    else { $report = $j; }
+
+}
+
+sub pause {
+    my $stats = shift;
+   
+    $terminal->Tgoto('cm', 0, 1, \*STDOUT); 
+    print "Screen is paused.  Press <ENTER> to resume...";
+    my $foo = <>;
+#    draw($stats);
+}
+
+sub time_change {
+    if ($time eq "old") { $time = "original"; }
+    elsif ($time eq "original") { $time = "old"; }
+}
+
